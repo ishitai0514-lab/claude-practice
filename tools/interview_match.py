@@ -3,9 +3,10 @@
 おすすめ順（総合判断が良い順）に提示するツール。
 
 パイプライン:
-  1. extract_profile(): 自由文 → 構造化プロフィール（正規表現・キーワード
-     ベースの簡易抽出。厳密なNLUではなく、面談メモの典型的な言い回しを
-     カバーする実務的なヒューリスティック）
+  1. extract_profile_via_claude(): 自由文 → 構造化プロフィール。
+     ローカルの正規表現・キーワードマッチではなく、`claude` CLI
+     （Claude Code が使うのと同じ認証済みCLI）を --print --json-schema で
+     非対話実行し、Claude自身に面談メモを読ませてJSONを抽出させる。
   2. JOB_META: jobs.csv の7求人をあらかじめ「業務内容の種類」「必須経験の
      カテゴリ」等のタグに構造化（求人側は数が少なく安定しているため、
      事前タグ付けを採用）
@@ -15,7 +16,8 @@
   5. おすすめ順にソートして提示
 """
 
-import re
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -78,118 +80,179 @@ COMPAT = {
 
 
 # ---------------------------------------------------------------------------
-# 1. 自由文 → 構造化プロフィール
+# 1. 自由文 → 構造化プロフィール（Claude自身に抽出させる）
 # ---------------------------------------------------------------------------
 
-SKILL_KEYWORDS = ["Java", "Python", "AWS", "React", "PHP", "Ruby", "Go", "C#", "SQL", "Azure", "GCP", "TypeScript"]
-INDUSTRY_KEYWORDS = ["金融", "製造業", "医療", "小売", "EC", "保険", "通信"]
+BUSINESS_TYPES = ["PM型", "開発PL型", "DX推進型", "ITアドバイザリー型", "経営戦略型", "不明"]
+ENGLISH_LEVELS = ["不問", "日常会話レベル", "ビジネスレベル", "不明"]
+
+EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "age": {"type": "string", "description": "年齢。例:「32歳」。読み取れなければ空文字。"},
+        "current_job": {"type": "string", "description": "現職（会社の種類・立場）の要約。"},
+        "years_experience_text": {"type": "string", "description": "経験年数の説明文。例:「独立系SESに5年在籍」。"},
+        "years_experience_number": {
+            "type": ["integer", "null"],
+            "description": "総経験年数を表す整数。読み取れなければ null。",
+        },
+        "experience_details": {"type": "string", "description": "経験内容（担当業務・マネジメント経験・業界経験等）の要約。"},
+        "orientation": {
+            "type": "object",
+            "properties": {
+                "current_business_type": {
+                    "type": "string",
+                    "enum": BUSINESS_TYPES,
+                    "description": "現在の実務内容として最も近い種類。",
+                },
+                "desired_business_type": {
+                    "type": "string",
+                    "enum": BUSINESS_TYPES,
+                    "description": (
+                        "本人が直近のキャリアステップとして具体的に望んでいる業務内容の種類。"
+                        "「ゆくゆくは」等の遠い将来の副次的な興味ではなく、"
+                        "最も強く・直近で望んでいる方向性を優先して1つ選ぶこと。"
+                    ),
+                },
+                "industry_theme": {"type": "string", "description": "業界・テーマへの関心（例: 金融、製造業など）。"},
+                "work_style": {"type": "string", "description": "働き方の希望（裁量重視／安定重視／昇格スピード重視 等）。"},
+                "career_direction": {"type": "string", "description": "キャリアの方向性（技術を極める／マネジメント／経営に近づく 等）。"},
+            },
+            "required": [
+                "current_business_type",
+                "desired_business_type",
+                "industry_theme",
+                "work_style",
+                "career_direction",
+            ],
+        },
+        "reason_for_change": {"type": "string", "description": "転職理由の要約。"},
+        "desired_conditions_text": {"type": "string", "description": "希望条件（年収・働き方など）の要約文。"},
+        "desired_salary_min": {
+            "type": ["integer", "null"],
+            "description": "希望年収の下限（万円単位の整数）。読み取れなければ null。",
+        },
+        "ng_conditions_text": {"type": "string", "description": "NG条件の要約文。"},
+        "ng_no_project_choice": {
+            "type": "boolean",
+            "description": "「案件を選べない環境」がNG条件として明言されているか。",
+        },
+        "ng_max_overtime_hours": {
+            "type": ["integer", "null"],
+            "description": "NGとなる残業時間の閾値（月◯時間、を表す整数）。言及がなければ null。",
+        },
+        "english_level": {
+            "type": "string",
+            "enum": ENGLISH_LEVELS,
+            "description": (
+                "英語力の水準。「英語は使わない／使用しない」「英語不要」等、"
+                "本人が英語を業務で使っていない・使う必要がない旨の記載がある場合は「不問」に分類する。"
+                "日常会話レベル・ビジネスレベルの明記があればそれに従う。判断材料が全くない場合のみ「不明」。"
+            ),
+        },
+    },
+    "required": [
+        "age",
+        "current_job",
+        "years_experience_text",
+        "years_experience_number",
+        "experience_details",
+        "orientation",
+        "reason_for_change",
+        "desired_conditions_text",
+        "desired_salary_min",
+        "ng_conditions_text",
+        "ng_no_project_choice",
+        "ng_max_overtime_hours",
+        "english_level",
+    ],
+}
+
+EXTRACTION_PROMPT_TEMPLATE = """あなたは人材紹介エージェントのアシスタントです。
+以下は転職候補者の面談メモ（自由文）です。この内容を分析し、指定されたJSON Schemaの
+とおりに構造化してください。本文に明記されていない項目は無理に推測せず、
+不明な場合は「不明」（該当するenumがあればそれ）や空文字・nullを使ってください。
+
+business_type（現在の実務／志向する業務内容の種類）は次の定義に基づいて分類してください:
+- PM型: 案件・プロジェクト全体を統括するプロジェクトマネジメント
+- 開発PL型: 開発チームのリード業務（現場マネジメント中心）
+- DX推進型: 技術を活かした業務改革・DX推進コンサルティング
+- ITアドバイザリー型: IT領域の経営・業務アドバイザリー、ITコンサルティング
+- 経営戦略型: IT要素の薄い、全社レベルの経営戦略・事業企画コンサルティング
+- 不明: 上記のいずれにも明確に当てはまらない場合
+
+desired_business_type は、本人が「ゆくゆくは」等の遠い将来の副次的な興味としてではなく、
+直近のキャリアステップとして最も強く望んでいる業務内容を優先してください。
+
+面談メモ:
+\"\"\"
+{text}
+\"\"\"
+"""
+
+DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
 
-def _first_match(pattern: str, text: str, group: int = 1):
-    m = re.search(pattern, text)
-    return m.group(group) if m else None
+def call_claude_extract(text: str, model: str = DEFAULT_MODEL) -> dict:
+    """`claude` CLI を --print --json-schema で非対話実行し、
+    面談メモをJSON Schemaに沿って構造化させる。"""
+    prompt = EXTRACTION_PROMPT_TEMPLATE.format(text=text)
+    cmd = [
+        "claude", "-p", prompt,
+        "--output-format", "json",
+        "--model", model,
+        "--json-schema", json.dumps(EXTRACTION_SCHEMA, ensure_ascii=False),
+    ]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"claude CLIの呼び出しに失敗しました: {result.stderr.strip()}")
+
+    payload = json.loads(result.stdout)
+    if payload.get("is_error"):
+        raise RuntimeError(f"claude CLIがエラーを返しました: {payload}")
+
+    structured = payload.get("structured_output")
+    if not structured:
+        raise RuntimeError(f"構造化出力が取得できませんでした: {payload}")
+    return structured
 
 
-def extract_profile(text: str) -> dict:
+def extract_profile(text: str, model: str = DEFAULT_MODEL) -> dict:
+    """自由文の面談メモをClaudeに構造化させ、match.pyの評価ロジックが
+    期待するキーを持つプロフィールdictに変換する。"""
+    data = call_claude_extract(text, model=model)
+    orientation = data.get("orientation", {})
+
     profile: dict = {"raw_text": text}
+    profile["年齢"] = data.get("age", "") or "不明"
+    profile["現職"] = data.get("current_job", "") or "不明"
+    profile["経験年数"] = data.get("years_experience_text", "") or "不明"
+    profile["years_experience"] = data.get("years_experience_number")
+    profile["経験内容"] = data.get("experience_details", "") or "不明"
 
-    age = _first_match(r"(\d{1,2})\s*歳", text)
-    profile["年齢"] = f"{age}歳" if age else ""
+    profile["current_business_type"] = orientation.get("current_business_type", "不明")
+    profile["want_business_type"] = orientation.get("desired_business_type", "不明")
+    profile["志向性"] = (
+        f"業務内容の種類: {orientation.get('desired_business_type', '不明')}／"
+        f"業界・テーマ: {orientation.get('industry_theme', '不明')}／"
+        f"働き方: {orientation.get('work_style', '不明')}／"
+        f"キャリア方向性: {orientation.get('career_direction', '不明')}"
+    )
 
-    years = _first_match(r"(\d{1,2})\s*年(?:在籍|目|ほど|勤務)", text)
-    years_experience = int(years) if years else None
-    profile["years_experience"] = years_experience
-    profile["経験年数"] = f"{years_experience}年" if years_experience else "不明"
+    profile["転職理由"] = data.get("reason_for_change", "") or "不明"
+    profile["希望条件"] = data.get("desired_conditions_text", "") or "不明"
+    profile["desired_salary_min"] = data.get("desired_salary_min")
 
-    if "独立系SES" in text:
-        profile["現職"] = "独立系SES企業"
-    elif "SES" in text:
-        profile["現職"] = "SES企業"
-    elif "SIer" in text:
-        profile["現職"] = "SIer"
-    else:
-        profile["現職"] = "不明"
+    profile["NG条件"] = data.get("ng_conditions_text", "") or "特記なし"
+    profile["ng_flags"] = {
+        "no_project_choice": bool(data.get("ng_no_project_choice")),
+        "max_overtime_hours": data.get("ng_max_overtime_hours"),
+    }
 
-    skills = [kw for kw in SKILL_KEYWORDS if kw in text]
-    if "チームリード" in text or "マネジメント" in text:
-        skills.append("チームマネジメント")
-    profile["スキル"] = "、".join(skills) if skills else "不明"
-
-    if any(k in text for k in ["開発", "エンジニア", "SE"]) and any(k in text for k in ["チームリード", "PL", "マネジメント"]):
-        current_type = "開発PL型"
-    elif any(k in text for k in ["開発", "エンジニア", "SE"]):
-        current_type = "開発PL型"
-    elif "コンサル" in text:
-        current_type = "経営戦略型"
-    else:
-        current_type = "不明"
-    profile["current_business_type"] = current_type
-
-    want_type = "不明"
-    if re.search(r"PM|プロジェクトマネージャ|案件全体を(仕切|統括)", text):
-        want_type = "PM型"
-    elif "コンサル" in text:
-        want_type = "ITアドバイザリー型"
-    elif re.search(r"DX|業務改革", text):
-        want_type = "DX推進型"
-    profile["want_business_type"] = want_type
-
-    industry_tags = {kw for kw in INDUSTRY_KEYWORDS if kw in text}
-    profile["industry_tags"] = industry_tags
-
-    if re.search(r"英語は使わない|英語不問|英語は不要|英語は使いません", text):
-        english_level = "不問"
-    elif "ビジネスレベル" in text:
-        english_level = "ビジネスレベル"
-    elif "日常会話" in text:
-        english_level = "日常会話レベル"
-    else:
-        english_level = "不明"
-    profile["英語力"] = english_level
-
-    ng_flags = {}
-    if re.search(r"案件を選べない|案件選定権限もない|案件を選ぶ(こと)?ができない", text):
-        ng_flags["no_project_choice"] = True
-    if re.search(r"月?(\d{2,3})\s*時間以上.*(残業|NG)", text):
-        h = _first_match(r"(\d{2,3})\s*時間以上.*(?:残業|NG)", text)
-        if h:
-            ng_flags["max_overtime_hours"] = int(h)
-    profile["ng_flags"] = ng_flags
-    ng_desc = []
-    if "案件を選べない" in text or "案件選定権限もない" in text:
-        ng_desc.append("案件を選べない環境は避けたい")
-    profile["NG条件"] = "、".join(ng_desc) if ng_desc else "特記なし"
-
-    salary = _first_match(r"年収.{0,4}?(\d{3,4})\s*万円?\s*以上", text)
-    profile["desired_salary_min"] = int(salary) if salary else None
-    want_reduce_onsite = bool(re.search(r"常駐比率.*下げたい|常駐を減らしたい", text))
-    profile["want_reduce_onsite"] = want_reduce_onsite
-
-    kibou_parts = []
-    if salary:
-        kibou_parts.append(f"年収{salary}万円以上")
-    if want_reduce_onsite:
-        kibou_parts.append("常駐比率を下げたい")
-    profile["希望条件"] = "、".join(kibou_parts) if kibou_parts else "特記なし"
-
-    tenshoku_riyuu = []
-    if "不満" in text or "ただし" in text:
-        for sentence in re.split(r"[。\n]", text):
-            if "不満" in sentence:
-                tenshoku_riyuu.append(sentence.strip())
-    profile["転職理由"] = "。".join(tenshoku_riyuu) if tenshoku_riyuu else "不明"
-
-    shikousei_parts = []
-    for sentence in re.split(r"[。\n]", text):
-        if re.search(r"たい$|将来的には", sentence) and not re.search(r"年収|希望", sentence):
-            shikousei_parts.append(sentence.strip())
-    profile["志向性"] = "。".join(shikousei_parts) if shikousei_parts else "不明"
-
-    keiken_naiyou = []
-    for sentence in re.split(r"[。\n]", text):
-        if re.search(r"担当|マネジメント|経験", sentence) and "不満" not in sentence:
-            keiken_naiyou.append(sentence.strip())
-    profile["経験内容"] = "。".join(keiken_naiyou) if keiken_naiyou else "不明"
+    profile["英語力"] = data.get("english_level", "不明")
+    profile["industry_tags"] = set()
 
     return profile
 
@@ -318,7 +381,7 @@ def evaluate(profile: dict) -> list:
 
 def print_profile(profile: dict) -> None:
     print("## 構造化プロフィール（自動抽出結果）\n")
-    for key in ["年齢", "現職", "経験年数", "経験内容", "スキル", "志向性", "転職理由", "希望条件", "NG条件", "英語力"]:
+    for key in ["年齢", "現職", "経験年数", "経験内容", "志向性", "転職理由", "希望条件", "NG条件", "英語力"]:
         print(f"- {key}：{profile.get(key, '')}")
     print(f"- （内部タグ）志向する業務内容の種類：{profile.get('want_business_type')}")
     print(f"- （内部タグ）現職の業務内容の種類：{profile.get('current_business_type')}")
@@ -342,12 +405,16 @@ def print_ranking(results: list) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) > 1:
-        text = " ".join(sys.argv[1:])
-    else:
-        text = sys.stdin.read()
+    args = sys.argv[1:]
+    model = DEFAULT_MODEL
+    if args and args[0] == "--model":
+        model = args[1]
+        args = args[2:]
 
-    profile = extract_profile(text)
+    text = " ".join(args) if args else sys.stdin.read()
+
+    print(f"（Claude（{model}）で面談メモを構造化しています…）\n", file=sys.stderr)
+    profile = extract_profile(text, model=model)
     print_profile(profile)
     results = evaluate(profile)
     print_ranking(results)
