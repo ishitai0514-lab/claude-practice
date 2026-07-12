@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """求人×候補者 マッチング判定ツール
 
-jobs/*.txt と candidates/*.txt を読み込み、以下の流れで判定する。
+jobs.csv と candidates.csv を読み込み、以下の流れで判定する。
   1. NG条件チェック（抵触すれば以降は評価せず「対象外」）
   2. A軸：志向性マッチ度（◎/○/△/✕）
   3. B軸：必須要件充足度（◎/○/△/✕）
@@ -17,43 +17,31 @@ A軸（志向性マッチ度）の評価方針:
     補足情報にとどめ、それを理由にA軸のランクを引き上げない。
 """
 
+import csv
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-JOBS_DIR = REPO_ROOT / "jobs"
-CANDIDATES_DIR = REPO_ROOT / "candidates"
+JOBS_CSV = REPO_ROOT / "jobs.csv"
+CANDIDATES_CSV = REPO_ROOT / "candidates.csv"
 
-JOB_FILES = {f"job{i}": f"job{i}.txt" for i in range(1, 8)}
-CANDIDATE_FILES = {f"candidate{i}": f"candidate{i}.txt" for i in range(1, 4)}
+JOB_IDS = [f"job{i}" for i in range(1, 8)]
+CANDIDATE_IDS = [f"candidate{i}" for i in range(1, 4)]
 
 
-def parse_txt(path: Path) -> dict:
-    """"キー：値" 形式の行を読み取る。1行に「／」区切りで複数項目が
-    連結されている場合（例: "氏名：G様（仮）／年齢：29歳"）も分解する。"""
-    data = {}
-    last_key = None
-    for line in path.read_text(encoding="utf-8").splitlines():
-        for segment in line.split("／"):
-            segment = segment.strip()
-            if not segment:
-                continue
-            if "：" in segment:
-                key, value = segment.split("：", 1)
-                key, value = key.strip(), value.strip()
-                data[key] = value
-                last_key = key
-            elif last_key is not None:
-                data[last_key] += f"／{segment}"
-    return data
+def load_csv_rows(path: Path) -> list:
+    with path.open(encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
 
 
 def load_jobs() -> dict:
-    return {jid: parse_txt(JOBS_DIR / fname) for jid, fname in JOB_FILES.items()}
+    rows = load_csv_rows(JOBS_CSV)
+    return dict(zip(JOB_IDS, rows))
 
 
 def load_candidates() -> dict:
-    return {cid: parse_txt(CANDIDATES_DIR / fname) for cid, fname in CANDIDATE_FILES.items()}
+    rows = load_csv_rows(CANDIDATES_CSV)
+    return dict(zip(CANDIDATE_IDS, rows))
 
 
 # ---------------------------------------------------------------------------
@@ -304,12 +292,12 @@ def print_report(candidate_id: str) -> None:
     cand = candidates[candidate_id]
 
     print(f"# {cand.get('氏名', candidate_id)} のマッチング結果\n")
-    print("| 求人 | 企業名／ポジション | NG判定 | A軸 | A軸理由 | B軸 | B軸理由 | 総合判断 |")
+    print("| 求人 | 会社名／ポジション名 | NG判定 | A軸 | A軸理由 | B軸 | B軸理由 | 総合判断 |")
     print("|---|---|---|---|---|---|---|---|")
 
-    for jid in JOB_FILES:
+    for jid in JOB_IDS:
         job = jobs[jid]
-        label = f"{job.get('企業名', '')} / {job.get('ポジション', '')}"
+        label = f"{job.get('会社名', '')} / {job.get('ポジション名', '')}"
         ok, ng_reason = ng_check(candidate_id, jid)
 
         if not ok:
